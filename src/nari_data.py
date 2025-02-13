@@ -11,9 +11,9 @@ class DataLoaderConfig:
 
     Attributes:
         batch_size: Number of samples per batch.
-        max_text_length: Fixed length for text sequences.
+        text_length: Fixed length for text sequences.
             NOTE: Must be greater than or equal to the maximum text length in the dataset.
-        max_audio_length: Fixed length for audio sequences.
+        audio_length: Fixed length for audio sequences.
             NOTE: Must be greater than or equal to (maximum audio length in the dataset + max(delay_pattern))
                   to ensure that valid audio data is preserved after applying delays.
         g_accum_iters: Gradient accumulation steps.
@@ -58,7 +58,7 @@ def generate_batch(
 ) -> tp.Tuple[np.ndarray, np.ndarray]:
     """Generate a batch with fixed padding (no truncation).
 
-    This function assumes that the fixed lengths (config.max_text_length and config.max_audio_length)
+    This function assumes that the fixed lengths (config.text_length and config.audio_length)
     are chosen to be larger than the maximum lengths in the dataset (for audio, larger than
     max(audio_length) + max(delay_pattern)). Consequently, each sample is padded up to the fixed size.
 
@@ -69,8 +69,8 @@ def generate_batch(
 
     Returns:
         Tuple of batches:
-          - texts: uint8 array of shape [batch, max_text_length]
-          - audios: int16 array of shape [batch, max_audio_length, 9]
+          - texts: uint8 array of shape [batch, text_length]
+          - audios: int16 array of shape [batch, audio_length, 9]
     """
     bs = config.batch_size * (config.g_accum_iters or 1)
     n_pairs = len(pairs)
@@ -96,9 +96,7 @@ def generate_batch(
 
     if config.g_accum_iters:
         text_arr = text_arr.reshape(config.g_accum_iters, config.batch_size, config.text_length)
-        audio_arr = audio_arr.reshape(
-            config.g_accum_iters, config.batch_size, config.audio_length, 9
-        )
+        audio_arr = audio_arr.reshape(config.g_accum_iters, config.batch_size, config.audio_length, 9)
 
     return text_arr, audio_arr
 
@@ -127,16 +125,17 @@ def apply_audio_delay(
         raise ValueError("Delay pattern must contain exactly 9 elements")
     B, T, C = audio.shape
     delay_arr = np.array(delay_pattern)  # Shape: (C,)
-    # Create a time index grid.
-    t_idx = np.arange(T)[None, :, None]            # Shape: (1, T, 1)
+    # Broadcast time indices to shape (B, T, 1)
+    t_idx = np.broadcast_to(np.arange(T)[None, :], (B, T))[:, :, None]  # Shape: (B, T, 1)
     delay_broadcast = delay_arr[None, None, :]       # Shape: (1, 1, C)
-    # Compute source indices for each channel.
-    new_t = t_idx - delay_broadcast                 # Shape: (1, T, C), broadcasts to (B, T, C)
+    # Compute shifted time indices for each channel.
+    new_t = t_idx - delay_broadcast                 # Shape: (B, T, C)
     valid = new_t >= 0                              # Boolean mask for valid indices.
-    # Create broadcastable indices for batch and channel.
-    b_idx = np.arange(B)[:, None, None]             # Shape: (B, 1, 1)
-    c_idx = np.arange(C)[None, None, :]              # Shape: (1, 1, C)
+    # Broadcast batch and channel indices to shape (B, T, C)
+    b_idx = np.broadcast_to(np.arange(B)[:, None, None], (B, T, C))
+    c_idx = np.broadcast_to(np.arange(C)[None, None, :], (B, T, C))
     result = np.full((B, T, C), pad_value, dtype=audio.dtype)
+    # Use advanced indexing with the broadcasted indices.
     result[valid] = audio[b_idx[valid], new_t[valid], c_idx[valid]]
     return result
 
@@ -165,12 +164,12 @@ def revert_audio_delay(
         raise ValueError("Delay pattern must contain exactly 9 elements")
     B, T, C = delayed_audio.shape
     delay_arr = np.array(delay_pattern)  # Shape: (C,)
-    t_idx = np.arange(T)[None, :, None]            # Shape: (1, T, 1)
+    t_idx = np.broadcast_to(np.arange(T)[None, :], (B, T))[:, :, None]  # Shape: (B, T, 1)
     delay_broadcast = delay_arr[None, None, :]       # Shape: (1, 1, C)
-    new_t = t_idx + delay_broadcast                 # Shape: (1, T, C)
+    new_t = t_idx + delay_broadcast                 # Shape: (B, T, C)
     valid = new_t < T
-    b_idx = np.arange(B)[:, None, None]
-    c_idx = np.arange(C)[None, None, :]
+    b_idx = np.broadcast_to(np.arange(B)[:, None, None], (B, T, C))
+    c_idx = np.broadcast_to(np.arange(C)[None, None, :], (B, T, C))
     result = np.full((B, T, C), pad_value, dtype=delayed_audio.dtype)
     result[valid] = delayed_audio[b_idx[valid], new_t[valid], c_idx[valid]]
     return result
