@@ -56,6 +56,24 @@ def load_pair(text_file: tf.Tensor, audio_file: tf.Tensor) -> tp.Tuple[tf.Tensor
     audio = load_raw_int16(audio_file)
     return text, audio
 
+def process_sample(text: tf.Tensor, audio: tf.Tensor, config: DataLoaderConfig) -> tp.Tuple[tf.Tensor, tf.Tensor]:
+    """
+    Pads text and audio tensors to fixed lengths.
+
+    Args:
+      text (tf.Tensor): 1D tensor of type uint8.
+      audio (tf.Tensor): 2D tensor of type int16 with shape [num_frames, 9].
+      config (DataLoaderConfig): Data loader configuration.
+
+    Returns:
+      Tuple of padded text and padded audio tensors.
+    """
+    padded_text = tf.pad(text, [[0, config.text_length - tf.shape(text)[0]]],
+                         constant_values=config.pad_value)
+    padded_audio = tf.pad(audio, [[0, config.audio_length - tf.shape(audio)[0]], [0, 0]],
+                          constant_values=config.pad_value)
+    return padded_text, padded_audio
+
 def build_delay_indices(batch_size: int, audio_length: int, delay_pattern: tp.List[int]
                         ) -> tp.Tuple[tf.Tensor, tf.Tensor]:
     """
@@ -68,10 +86,10 @@ def build_delay_indices(batch_size: int, audio_length: int, delay_pattern: tp.Li
             batch indices, tf.maximum(t_idx_BTC, 0), and channel indices.
     """
     C = 9
-    delay_arr = tf.constant(delay_pattern, dtype=tf.int32)  # shape: [9]
+    delay_arr = tf.constant(delay_pattern, dtype=tf.int32)
     # Compute time indices: shape [B, T, 1]
     t_idx_BT1 = tf.broadcast_to(tf.expand_dims(tf.range(audio_length), axis=0), [batch_size, audio_length])
-    t_idx_BT1 = tf.expand_dims(t_idx_BT1, axis=-1)  # shape: [B, T, 1]
+    t_idx_BT1 = tf.expand_dims(t_idx_BT1, axis=-1)
     # Subtract delay per channel: shape becomes [B, T, 9]
     t_idx_BTC = t_idx_BT1 - tf.reshape(delay_arr, [1, 1, C])
     
@@ -81,7 +99,6 @@ def build_delay_indices(batch_size: int, audio_length: int, delay_pattern: tp.Li
     c_idx_BTC = tf.broadcast_to(tf.reshape(tf.range(C), [1, 1, C]),
                                 [batch_size, audio_length, C])
     
-    # Stack indices for gather_nd using safe (nonnegative) time indices.
     indices = tf.stack([
         tf.reshape(b_idx_BTC, [-1]),
         tf.reshape(tf.maximum(t_idx_BTC, 0), [-1]),
@@ -157,6 +174,20 @@ def revert_audio_delay(audio_BTC: tf.Tensor, pad_value: int, delay_pattern: tp.L
     result = tf.where(t_idx_BTC >= T, tf.cast(pad_value, audio_BTC.dtype), gathered)
     return result
 
+def map_process_sample(text: tf.Tensor, audio: tf.Tensor, config: DataLoaderConfig) -> tp.Tuple[tf.Tensor, tf.Tensor]:
+    """
+    Mapping function to pad text and audio tensors.
+    """
+    return process_sample(text, audio, config)
+
+def map_apply_delay(txt: tf.Tensor, audio: tf.Tensor, config: DataLoaderConfig,
+                    delay_precomp: tp.Tuple[tf.Tensor, tf.Tensor]) -> tp.Tuple[tf.Tensor, tf.Tensor]:
+    """
+    Mapping function to apply the audio delay.
+    """
+    delayed_audio = apply_audio_delay(audio, config.pad_value, config.delay_pattern, delay_precomp)
+    return txt, delayed_audio
+
 def create_dataset(data_dir: pathlib.Path, config: DataLoaderConfig, seed: int = 42) -> tf.data.Dataset:
     """
     Creates a tf.data.Dataset from paired text and audio files.
@@ -186,23 +217,18 @@ def create_dataset(data_dir: pathlib.Path, config: DataLoaderConfig, seed: int =
     ds = tf.data.Dataset.from_tensor_slices((text_files, audio_files))
     ds = ds.map(load_pair, num_parallel_calls=tf.data.AUTOTUNE)
     
-    # Pad text and audio to fixed lengths.
-    ds = ds.map(lambda text, audio: (
-        tf.pad(text, [[0, config.text_length - tf.shape(text)[0]]],
-               constant_values=config.pad_value),
-        tf.pad(audio, [[0, config.audio_length - tf.shape(audio)[0]], [0, 0]],
-               constant_values=config.pad_value)
-    ), num_parallel_calls=tf.data.AUTOTUNE)
+    # Apply padding using a named mapping function.
+    ds = ds.map(lambda text, audio: map_process_sample(text, audio, config),
+                num_parallel_calls=tf.data.AUTOTUNE)
     
     ds = ds.batch(config.batch_size)
     
     # Precompute indices for delay and revert operations.
     delay_precomp = build_delay_indices(config.batch_size, config.audio_length, config.delay_pattern)
     
-    ds = ds.map(lambda txt, audio: (
-        txt,
-        apply_audio_delay(audio, config.pad_value, config.delay_pattern, delay_precomp)
-    ), num_parallel_calls=tf.data.AUTOTUNE)
+    # Apply the delay using a named mapping function.
+    ds = ds.map(lambda txt, audio: map_apply_delay(txt, audio, config, delay_precomp),
+                num_parallel_calls=tf.data.AUTOTUNE)
     
-    ds = ds.prefetch(2, tf.data.AUTOTUNE)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
