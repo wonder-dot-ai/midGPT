@@ -161,7 +161,6 @@ def build_revert_indices(
 def apply_audio_delay(
     audio_BTC: tf.Tensor,
     pad_value: int,
-    delay_pattern: tp.List[int],
     precomp: tp.Tuple[tf.Tensor, tf.Tensor],
 ) -> tf.Tensor:
     """
@@ -185,7 +184,6 @@ def apply_audio_delay(
 def revert_audio_delay(
     audio_BTC: tf.Tensor,
     pad_value: int,
-    delay_pattern: tp.List[int],
     precomp: tp.Tuple[tf.Tensor, tf.Tensor],
     T: int,
 ) -> tf.Tensor:
@@ -208,9 +206,7 @@ def revert_audio_delay(
     return result
 
 
-def create_dataset(
-    data_dir: pathlib.Path, config: DataLoaderConfig, seed: int = 42
-) -> tf.data.Dataset:
+def create_dataset(data_dir: pathlib.Path, config: DataLoaderConfig) -> tf.data.Dataset:
     """
     Creates a tf.data.Dataset from paired text and audio files.
 
@@ -254,8 +250,10 @@ def create_dataset(
 
     # Apply the delay using a named mapping function.
     ds = ds.map(
-        lambda txt, audio: txt,
-        apply_delay(audio, config.pad_value, config.delay_pattern, delay_precomp),
+        lambda txt, audio: (
+            txt,
+            apply_audio_delay(audio, config.pad_value, delay_precomp),
+        ),
         num_parallel_calls=tf.data.AUTOTUNE,
     )
 
