@@ -3,11 +3,13 @@ import typing as tp
 import numpy as np
 import jax
 from dataclasses import dataclass
+import tensorflow as tf
 
 
 @dataclass
 class DataLoaderConfig:
-    """Container for dataloader parameters.
+    """
+    Container for dataloader parameters.
 
     Attributes:
         batch_size: Number of samples per batch.
@@ -16,89 +18,69 @@ class DataLoaderConfig:
         audio_length: Fixed length for audio sequences.
             NOTE: Must be greater than or equal to (maximum audio length in the dataset + max(delay_pattern))
                   to ensure that valid audio data is preserved after applying delays.
-        g_accum_iters: Gradient accumulation steps.
         pad_value: Padding value for sequences.
     """
+
     batch_size: int
     text_length: int
     audio_length: int
-    g_accum_iters: tp.Optional[int] = None
     pad_value: int = 0
 
 
-def load_data_pairs(data_dir: str) -> tp.List[tp.Tuple[np.ndarray, np.ndarray]]:
-    """Load all text-audio file pairs without length validation."""
-    pairs = []
-    txt_files = [f for f in os.listdir(data_dir) if f.endswith(".txt")]
-
-    for txt_file in txt_files:
-        base = os.path.splitext(txt_file)[0]
-        audio_file = os.path.join(data_dir, f"{base}.npy")
-
-        if not os.path.exists(audio_file):
-            continue
-
-        # Load text and convert to uint8 tokens.
-        with open(os.path.join(data_dir, txt_file), "r", encoding="utf-8") as f:
-            text = np.frombuffer(f.read().encode("utf-8"), dtype=np.uint8)
-
-        # Load audio and ensure int16 dtype.
-        audio = np.load(audio_file).astype(np.int16)
-        pairs.append((text, audio))
-
-    if not pairs:
-        raise ValueError(f"No valid text-audio pairs in {data_dir}")
-    return pairs
-
-
-def generate_batch(
-    pairs: tp.List[tp.Tuple[np.ndarray, np.ndarray]],
-    config: DataLoaderConfig,
-    rng_key: jax.Array,
-) -> tp.Tuple[np.ndarray, np.ndarray]:
-    """Generate a batch with fixed padding (no truncation).
-
-    This function assumes that the fixed lengths (config.text_length and config.audio_length)
-    are chosen to be larger than the maximum lengths in the dataset (for audio, larger than
-    max(audio_length) + max(delay_pattern)). Consequently, each sample is padded up to the fixed size.
-
-    Args:
-        pairs: All loaded text-audio pairs.
-        config: DataLoader configuration.
-        rng_key: JAX PRNG key for reproducible sampling.
-
-    Returns:
-        Tuple of batches:
-          - texts: uint8 array of shape [batch, text_length]
-          - audios: int16 array of shape [batch, audio_length, 9]
+def create_tf_dataset_from_dir(
+    data_dir: str, config: DataLoaderConfig, seed: int = 42
+) -> tf.data.Dataset:
     """
-    bs = config.batch_size * (config.g_accum_iters or 1)
-    n_pairs = len(pairs)
-    rng_key, choice_key = jax.random.split(rng_key)
-    replace = bs > n_pairs
-    pair_ix = jax.random.choice(choice_key, n_pairs, shape=(bs,), replace=replace)
-    pair_ix_np = np.asarray(pair_ix)
+    Create a TensorFlow Dataset directly from a directory containing paired .txt and .npy files.
+    The dataset is created lazily so that data is read from disk as needed.
 
-    # Select samples.
-    selected_texts = [pairs[i][0] for i in pair_ix_np]
-    selected_audios = [pairs[i][1] for i in pair_ix_np]
+    Each sample is processed as follows:
+      - The text file is read (as raw bytes) and decoded into a vector of uint8.
+      - The corresponding .npy audio file is loaded (via a py_function) into a [None, 9] int16 tensor.
+      - Both text and audio are truncated/padded to fixed lengths defined in the config.
 
-    # Preallocate full arrays with pad_value.
-    text_arr = np.full((bs, config.text_length), config.pad_value, dtype=np.uint8)
-    for i, t in enumerate(selected_texts):
-        L = t.shape[0]
-        text_arr[i, :L] = t
+    The resulting dataset is shuffled, batched, and prefetched.
+    """
+    pattern = os.path.join(data_dir, "*.txt")
+    ds = tf.data.Dataset.list_files(pattern, shuffle=True, seed=seed)
 
-    audio_arr = np.full((bs, config.audio_length, 9), config.pad_value, dtype=np.int16)
-    for i, a in enumerate(selected_audios):
-        L = a.shape[0]
-        audio_arr[i, :L, :] = a
+    def _load_sample(text_path):
+        # Read text file and convert to uint8 vector.
+        text_content = tf.io.read_file(text_path)
+        text = tf.io.decode_raw(text_content, tf.uint8)
+        # Compute corresponding .npy audio file path.
+        audio_path = tf.strings.regex_replace(text_path, r"\.txt$", ".npy")
 
-    if config.g_accum_iters:
-        text_arr = text_arr.reshape(config.g_accum_iters, config.batch_size, config.text_length)
-        audio_arr = audio_arr.reshape(config.g_accum_iters, config.batch_size, config.audio_length, 9)
+        # Use py_function to load .npy file.
+        def _load_npy(file_path):
+            file_path = file_path.numpy().decode("utf-8")
+            audio = np.load(file_path).astype(np.int16)
+            return audio
 
-    return text_arr, audio_arr
+        audio = tf.py_function(func=_load_npy, inp=[audio_path], Tout=tf.int16)
+        # Set shape info (audio is [None, 9]).
+        audio.set_shape([None, 9])
+        return text, audio
+
+    ds = ds.map(_load_sample, num_parallel_calls=tf.data.AUTOTUNE)
+
+    def process_sample(text, audio):
+        text = tf.pad(
+            text,
+            [[0, config.text_length - tf.shape(text)[0]]],
+            constant_values=config.pad_value,
+        )
+        audio = tf.pad(
+            audio,
+            [[0, config.audio_length - tf.shape(audio)[0]], [0, 0]],
+            constant_values=config.pad_value,
+        )
+        return text, audio
+
+    ds = ds.map(process_sample, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.batch(config.batch_size)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+    return ds
 
 
 def apply_audio_delay(
@@ -127,10 +109,10 @@ def apply_audio_delay(
     delay_arr = np.array(delay_pattern)  # Shape: (C,)
     # Broadcast time indices to shape (B, T, 1)
     t_idx = np.broadcast_to(np.arange(T)[None, :], (B, T))[:, :, None]  # Shape: (B, T, 1)
-    delay_broadcast = delay_arr[None, None, :]       # Shape: (1, 1, C)
+    delay_broadcast = delay_arr[None, None, :]  # Shape: (1, 1, C)
     # Compute shifted time indices for each channel.
-    new_t = t_idx - delay_broadcast                 # Shape: (B, T, C)
-    valid = new_t >= 0                              # Boolean mask for valid indices.
+    new_t = t_idx - delay_broadcast  # Shape: (B, T, C)
+    valid = new_t >= 0  # Boolean mask for valid indices.
     # Broadcast batch and channel indices to shape (B, T, C)
     b_idx = np.broadcast_to(np.arange(B)[:, None, None], (B, T, C))
     c_idx = np.broadcast_to(np.arange(C)[None, None, :], (B, T, C))
@@ -165,8 +147,8 @@ def revert_audio_delay(
     B, T, C = delayed_audio.shape
     delay_arr = np.array(delay_pattern)  # Shape: (C,)
     t_idx = np.broadcast_to(np.arange(T)[None, :], (B, T))[:, :, None]  # Shape: (B, T, 1)
-    delay_broadcast = delay_arr[None, None, :]       # Shape: (1, 1, C)
-    new_t = t_idx + delay_broadcast                 # Shape: (B, T, C)
+    delay_broadcast = delay_arr[None, None, :]  # Shape: (1, 1, C)
+    new_t = t_idx + delay_broadcast  # Shape: (B, T, C)
     valid = new_t < T
     b_idx = np.broadcast_to(np.arange(B)[:, None, None], (B, T, C))
     c_idx = np.broadcast_to(np.arange(C)[None, None, :], (B, T, C))
