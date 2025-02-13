@@ -21,7 +21,6 @@ class DataLoaderConfig:
     text_length: int
     audio_length: int
     pad_value: int = 0
-    prefetch_size: int = 1
     delay_pattern: tp.List[int] = field(
         default_factory=lambda: [0, 1, 2, 3, 4, 5, 6, 7, 8]
     )
@@ -260,5 +259,5 @@ def create_dataset(
         num_parallel_calls=tf.data.AUTOTUNE,
     )
 
-    ds = ds.prefetch(config.prefetch_size, tf.data.AUTOTUNE)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
