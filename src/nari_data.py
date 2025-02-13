@@ -1,157 +1,137 @@
-import os
+import pathlib
 import typing as tp
 import numpy as np
-import jax
-from dataclasses import dataclass
 import tensorflow as tf
-
+from dataclasses import dataclass, field
 
 @dataclass
 class DataLoaderConfig:
     """
-    Container for dataloader parameters.
+    DataLoader configuration.
 
     Attributes:
-        batch_size: Number of samples per batch.
-        text_length: Fixed length for text sequences.
-            NOTE: Must be greater than or equal to the maximum text length in the dataset.
-        audio_length: Fixed length for audio sequences.
-            NOTE: Must be greater than or equal to (maximum audio length in the dataset + max(delay_pattern))
-                  to ensure that valid audio data is preserved after applying delays.
-        pad_value: Padding value for sequences.
+      batch_size (int): Number of samples per batch.
+      text_length (int): Fixed text length (each text tensor becomes [text_length]).
+      audio_length (int): Fixed audio length (each audio tensor becomes [audio_length, 9]).
+      pad_value (int): Padding value.
+      delay_pattern (List[int]): Delay steps for 9 codebook channels.
     """
-
     batch_size: int
     text_length: int
     audio_length: int
     pad_value: int = 0
+    delay_pattern: tp.List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6, 7, 8])
 
-
-def create_tf_dataset_from_dir(
-    data_dir: str, config: DataLoaderConfig, seed: int = 42
-) -> tf.data.Dataset:
+def create_dataset(data_dir: pathlib.Path, config: DataLoaderConfig, seed: int = 42) -> tf.data.Dataset:
     """
-    Create a TensorFlow Dataset directly from a directory containing paired .txt and .npy files.
-    The dataset is created lazily so that data is read from disk as needed.
+    Creates a tf.data.Dataset from paired .txt and .npy files.
 
-    Each sample is processed as follows:
-      - The text file is read (as raw bytes) and decoded into a vector of uint8.
-      - The corresponding .npy audio file is loaded (via a py_function) into a [None, 9] int16 tensor.
-      - Both text and audio are truncated/padded to fixed lengths defined in the config.
+    Each sample:
+      - Reads a text file, decodes it to a uint8 vector (shape [L_text]),
+      - Loads a .npy audio file as an int16 tensor (shape [T, 9]),
+      - Pads text to [text_length] and audio to [audio_length, 9],
+      - Applies an audio delay using config.delay_pattern.
 
-    The resulting dataset is shuffled, batched, and prefetched.
+    Args:
+      data_dir (pathlib.Path): Directory with .txt and .npy files.
+      config (DataLoaderConfig): Data loader configuration.
+      seed (int): Shuffle seed.
+
+    Returns:
+      tf.data.Dataset: Yields tuples (txt_L, delayed_audio_L9) where:
+        txt_L: tf.Tensor, shape [batch_size, text_length], dtype tf.uint8.
+        delayed_audio_L9: tf.Tensor, shape [batch_size, audio_length, 9], dtype tf.int16.
     """
-    pattern = os.path.join(data_dir, "*.txt")
+    pattern = str(data_dir / "*.txt")
     ds = tf.data.Dataset.list_files(pattern, shuffle=True, seed=seed)
 
-    def _load_sample(text_path):
-        # Read text file and convert to uint8 vector.
-        text_content = tf.io.read_file(text_path)
-        text = tf.io.decode_raw(text_content, tf.uint8)
-        # Compute corresponding .npy audio file path.
+    def _load_sample(text_path: tf.Tensor) -> tp.Tuple[tf.Tensor, tf.Tensor]:
+        txt_1D = tf.io.decode_raw(tf.io.read_file(text_path), tf.uint8)
         audio_path = tf.strings.regex_replace(text_path, r"\.txt$", ".npy")
-
-        # Use py_function to load .npy file.
-        def _load_npy(file_path):
-            file_path = file_path.numpy().decode("utf-8")
-            audio = np.load(file_path).astype(np.int16)
-            return audio
-
-        audio = tf.py_function(func=_load_npy, inp=[audio_path], Tout=tf.int16)
-        # Set shape info (audio is [None, 9]).
-        audio.set_shape([None, 9])
-        return text, audio
+        
+        def _load_npy(fp: tf.Tensor) -> np.ndarray:
+            fp_str = fp.numpy().decode("utf-8")
+            return np.load(fp_str).astype(np.int16)
+        audio_T9 = tf.py_function(_load_npy, inp=[audio_path], Tout=tf.int16)
+        audio_T9.set_shape([None, 9])
+        return txt_1D, audio_T9
 
     ds = ds.map(_load_sample, num_parallel_calls=tf.data.AUTOTUNE)
 
-    def process_sample(text, audio):
-        text = tf.pad(
-            text,
-            [[0, config.text_length - tf.shape(text)[0]]],
-            constant_values=config.pad_value,
-        )
-        audio = tf.pad(
-            audio,
-            [[0, config.audio_length - tf.shape(audio)[0]], [0, 0]],
-            constant_values=config.pad_value,
-        )
-        return text, audio
+    def process_sample(txt_1D: tf.Tensor, audio_T9: tf.Tensor) -> tp.Tuple[tf.Tensor, tf.Tensor]:
+        txt_L = tf.pad(txt_1D, [[0, config.text_length - tf.shape(txt_1D)[0]]], constant_values=config.pad_value)
+        audio_L9 = tf.pad(audio_T9, [[0, config.audio_length - tf.shape(audio_T9)[0]], [0, 0]], constant_values=config.pad_value)
+        return txt_L, audio_L9
 
-    ds = ds.map(process_sample, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.batch(config.batch_size)
-    ds = ds.prefetch(tf.data.AUTOTUNE)
+    ds = ds.map(process_sample, num_parallel_calls=tf.data.AUTOTUNE).cache()
+
+    def apply_delay(txt_L: tf.Tensor, audio_L9: tf.Tensor) -> tp.Tuple[tf.Tensor, tf.Tensor]:
+        delayed_audio_L9 = tf.py_function(
+            func=lambda aud: apply_audio_delay(aud, config.pad_value, config.delay_pattern),
+            inp=[audio_L9],
+            Tout=tf.int16)
+        delayed_audio_L9.set_shape(audio_L9.shape)
+        return txt_L, delayed_audio_L9
+
+    ds = ds.map(apply_delay, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.batch(config.batch_size).prefetch(tf.data.AUTOTUNE)
     return ds
 
-
 def apply_audio_delay(
-    audio: np.ndarray,
+    audio_BTC: np.ndarray,
     pad_value: int,
-    delay_pattern: tp.List[int] = [0, 1, 2, 3, 4, 5, 6, 7, 8],
+    delay_pattern: tp.List[int] = [0, 1, 2, 3, 4, 5, 6, 7, 8]
 ) -> np.ndarray:
     """
-    Apply a codebook delay pattern to audio tokens without changing the sequence length.
-
-    The input and output audio both have shape [batch, seq_len, 9]. For each codebook channel,
-    tokens are shifted right by the specified delay. Positions where valid data is not available
-    due to the shift are filled with pad_value. This implementation is fully vectorized.
+    Applies a delay pattern to audio tokens.
 
     Args:
-        audio: int16 array of shape [batch, seq_len, 9].
-        pad_value: Padding value.
-        delay_pattern: List of delay steps for each codebook (must have length 9).
+      audio_BTC (np.ndarray): int16 array with shape [B, T, 9] 
+         (B=batch size, T=audio frames, 9=channels).
+      pad_value (int): Padding value.
+      delay_pattern (List[int]): Delay steps for each channel (length 9).
 
     Returns:
-        int16 array of shape [batch, seq_len, 9] with delayed codebooks.
+      np.ndarray: Delayed audio with shape [B, T, 9], dtype int16.
     """
     if len(delay_pattern) != 9:
-        raise ValueError("Delay pattern must contain exactly 9 elements")
-    B, T, C = audio.shape
-    delay_arr = np.array(delay_pattern)  # Shape: (C,)
-    # Broadcast time indices to shape (B, T, 1)
-    t_idx = np.broadcast_to(np.arange(T)[None, :], (B, T))[:, :, None]  # Shape: (B, T, 1)
-    delay_broadcast = delay_arr[None, None, :]  # Shape: (1, 1, C)
-    # Compute shifted time indices for each channel.
-    new_t = t_idx - delay_broadcast  # Shape: (B, T, C)
-    valid = new_t >= 0  # Boolean mask for valid indices.
-    # Broadcast batch and channel indices to shape (B, T, C)
-    b_idx = np.broadcast_to(np.arange(B)[:, None, None], (B, T, C))
-    c_idx = np.broadcast_to(np.arange(C)[None, None, :], (B, T, C))
-    result = np.full((B, T, C), pad_value, dtype=audio.dtype)
-    # Use advanced indexing with the broadcasted indices.
-    result[valid] = audio[b_idx[valid], new_t[valid], c_idx[valid]]
-    return result
-
+        raise ValueError("Delay pattern must have 9 elements")
+    B, T, C = audio_BTC.shape
+    delay_arr_C = np.array(delay_pattern)
+    t_idx_BTx1 = np.broadcast_to(np.arange(T)[None, :], (B, T))[:, :, None]
+    new_t_BTC = t_idx_BTx1 - delay_arr_C[None, None, :]
+    valid_BTC = new_t_BTC >= 0
+    b_idx_BTC = np.broadcast_to(np.arange(B)[:, None, None], (B, T, C))
+    c_idx_BTC = np.broadcast_to(np.arange(C)[None, None, :], (B, T, C))
+    result_BTC = np.full((B, T, C), pad_value, dtype=audio_BTC.dtype)
+    result_BTC[valid_BTC] = audio_BTC[b_idx_BTC[valid_BTC], new_t_BTC[valid_BTC], c_idx_BTC[valid_BTC]]
+    return result_BTC
 
 def revert_audio_delay(
-    delayed_audio: np.ndarray,
+    delayed_audio_BTC: np.ndarray,
     delay_pattern: tp.List[int],
-    pad_value: int,
+    pad_value: int
 ) -> np.ndarray:
     """
-    Reverse the codebook delay pattern to recover original audio tokens without changing the sequence length.
-
-    The input and output audio both have shape [batch, seq_len, 9]. For each codebook channel,
-    tokens are shifted left by the specified delay. Positions where valid data is not available
-    due to the shift are filled with pad_value. This implementation is fully vectorized.
+    Reverts a delay pattern from audio tokens.
 
     Args:
-        delayed_audio: int16 array of shape [batch, seq_len, 9].
-        delay_pattern: The delay pattern originally applied (must have length 9).
-        pad_value: Padding value.
-
+      delayed_audio_BTC (np.ndarray): int16 array with shape [B, T, 9].
+      delay_pattern (List[int]): Delay pattern (length 9).
+      pad_value (int): Padding value.
+    
     Returns:
-        int16 array of shape [batch, seq_len, 9] with recovered codebooks.
+      np.ndarray: Recovered audio with shape [B, T, 9], dtype int16.
     """
     if len(delay_pattern) != 9:
-        raise ValueError("Delay pattern must contain exactly 9 elements")
-    B, T, C = delayed_audio.shape
-    delay_arr = np.array(delay_pattern)  # Shape: (C,)
-    t_idx = np.broadcast_to(np.arange(T)[None, :], (B, T))[:, :, None]  # Shape: (B, T, 1)
-    delay_broadcast = delay_arr[None, None, :]  # Shape: (1, 1, C)
-    new_t = t_idx + delay_broadcast  # Shape: (B, T, C)
-    valid = new_t < T
-    b_idx = np.broadcast_to(np.arange(B)[:, None, None], (B, T, C))
-    c_idx = np.broadcast_to(np.arange(C)[None, None, :], (B, T, C))
-    result = np.full((B, T, C), pad_value, dtype=delayed_audio.dtype)
-    result[valid] = delayed_audio[b_idx[valid], new_t[valid], c_idx[valid]]
-    return result
+        raise ValueError("Delay pattern must have 9 elements")
+    B, T, C = delayed_audio_BTC.shape
+    delay_arr_C = np.array(delay_pattern)
+    t_idx_BTx1 = np.broadcast_to(np.arange(T)[None, :], (B, T))[:, :, None]
+    new_t_BTC = t_idx_BTx1 + delay_arr_C[None, None, :]
+    valid_BTC = new_t_BTC < T
+    b_idx_BTC = np.broadcast_to(np.arange(B)[:, None, None], (B, T, C))
+    c_idx_BTC = np.broadcast_to(np.arange(C)[None, None, :], (B, T, C))
+    result_BTC = np.full((B, T, C), pad_value, dtype=delayed_audio_BTC.dtype)
+    result_BTC[valid_BTC] = delayed_audio_BTC[b_idx_BTC[valid_BTC], new_t_BTC[valid_BTC], c_idx_BTC[valid_BTC]]
+    return result_BTC
