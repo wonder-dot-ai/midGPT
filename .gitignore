@@ -10,3 +10,4 @@ outputs
 wandb/
 plugins/
 .venv/
+small_toy_data/

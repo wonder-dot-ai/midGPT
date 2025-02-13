@@ -1,0 +1,35 @@
+from src.train import ExperimentConfig
+from src.nari_model import NariConfig
+
+config = ExperimentConfig(
+    rundir="",
+    data_dir="./small_toy_data",
+    learning_rate=1e-3,
+    batch_size=32,
+    warmup_steps=100,
+    min_lr=1e-4,
+    lr_decay_steps=5000,
+    max_steps=5000,
+    beta2=0.99,
+    weight_decay=1e-4,
+    eval_interval=500,
+    compute_dtype="bfloat16",
+    param_dtype="float32",
+    g_accum_iters=1,
+    shard_model=False,
+    model_config=NariConfig(
+        enc_block_size=256,
+        dec_block_size=256,
+        src_vocab_size=256,
+        tgt_vocab_size=256,
+        n_enc_layer=6,
+        n_dec_layer=6,
+        n_enc_embd=384,
+        n_dec_embd=384,
+        n_enc_head=6,
+        n_dec_gqa_query_head=6,
+        n_dec_cross_query_head=6,
+        n_dec_kv_head=6,
+        dropout=0.0,
+    ),
+)
