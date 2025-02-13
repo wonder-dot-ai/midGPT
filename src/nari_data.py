@@ -7,21 +7,27 @@ from dataclasses import dataclass
 
 @dataclass
 class DataLoaderConfig:
-    """Container for dataloader parameters
+    """Container for dataloader parameters.
 
     Attributes:
-        batch_size: Number of samples per batch
-        g_accum_iters: Gradient accumulation steps
-        pad_value: Padding value for sequences
+        batch_size: Number of samples per batch.
+        max_text_length: Fixed length for text sequences.
+            NOTE: Must be greater than or equal to the maximum text length in the dataset.
+        max_audio_length: Fixed length for audio sequences.
+            NOTE: Must be greater than or equal to (maximum audio length in the dataset + max(delay_pattern))
+                  to ensure that valid audio data is preserved after applying delays.
+        g_accum_iters: Gradient accumulation steps.
+        pad_value: Padding value for sequences.
     """
-
     batch_size: int
+    text_length: int
+    audio_length: int
     g_accum_iters: tp.Optional[int] = None
     pad_value: int = 0
 
 
 def load_data_pairs(data_dir: str) -> tp.List[tp.Tuple[np.ndarray, np.ndarray]]:
-    """Load all text-audio file pairs without length validation"""
+    """Load all text-audio file pairs without length validation."""
     pairs = []
     txt_files = [f for f in os.listdir(data_dir) if f.endswith(".txt")]
 
@@ -32,13 +38,12 @@ def load_data_pairs(data_dir: str) -> tp.List[tp.Tuple[np.ndarray, np.ndarray]]:
         if not os.path.exists(audio_file):
             continue
 
-        # Load text
+        # Load text and convert to uint8 tokens.
         with open(os.path.join(data_dir, txt_file), "r", encoding="utf-8") as f:
             text = np.frombuffer(f.read().encode("utf-8"), dtype=np.uint8)
 
-        # Load audio
+        # Load audio and ensure int16 dtype.
         audio = np.load(audio_file).astype(np.int16)
-
         pairs.append((text, audio))
 
     if not pairs:
@@ -51,61 +56,49 @@ def generate_batch(
     config: DataLoaderConfig,
     rng_key: jax.Array,
 ) -> tp.Tuple[np.ndarray, np.ndarray]:
-    """Generate batch with dynamic padding to longest in batch
+    """Generate a batch with fixed padding (no truncation).
+
+    This function assumes that the fixed lengths (config.max_text_length and config.max_audio_length)
+    are chosen to be larger than the maximum lengths in the dataset (for audio, larger than
+    max(audio_length) + max(delay_pattern)). Consequently, each sample is padded up to the fixed size.
 
     Args:
-        pairs: All loaded text-audio pairs
-        config: DataLoader configuration
-        rng_key: JAX PRNG key for reproducible sampling
+        pairs: All loaded text-audio pairs.
+        config: DataLoader configuration.
+        rng_key: JAX PRNG key for reproducible sampling.
 
     Returns:
-        Tuple of padded batches where:
-        - texts: uint8 array [batch, max_text_len]
-        - audios: int16 array [batch, max_audio_len, 9]
+        Tuple of batches:
+          - texts: uint8 array of shape [batch, max_text_length]
+          - audios: int16 array of shape [batch, max_audio_length, 9]
     """
     bs = config.batch_size * (config.g_accum_iters or 1)
     n_pairs = len(pairs)
-
-    # Split RNG key for sampling operations
     rng_key, choice_key = jax.random.split(rng_key)
-
-    # Smart selection with replacement only when necessary
-    replace = bs > n_pairs  # Only replace if we need more samples than available
+    replace = bs > n_pairs
     pair_ix = jax.random.choice(choice_key, n_pairs, shape=(bs,), replace=replace)
-
-    # Convert to numpy for indexing
     pair_ix_np = np.asarray(pair_ix)
 
-    # Collect selected samples
+    # Select samples.
     selected_texts = [pairs[i][0] for i in pair_ix_np]
     selected_audios = [pairs[i][1] for i in pair_ix_np]
 
-    # Find maximum lengths in this batch
-    max_text_len = max(len(t) for t in selected_texts)
-    max_audio_len = max(len(a) for a in selected_audios)
+    # Preallocate full arrays with pad_value.
+    text_arr = np.full((bs, config.text_length), config.pad_value, dtype=np.uint8)
+    for i, t in enumerate(selected_texts):
+        L = t.shape[0]
+        text_arr[i, :L] = t
 
-    # Pad texts
-    text_batch = [
-        np.pad(t, (0, max_text_len - len(t)), constant_values=config.pad_value)
-        for t in selected_texts
-    ]
+    audio_arr = np.full((bs, config.audio_length, 9), config.pad_value, dtype=np.int16)
+    for i, a in enumerate(selected_audios):
+        L = a.shape[0]
+        audio_arr[i, :L, :] = a
 
-    # Pad audios (preserve codebook dimension)
-    audio_batch = [
-        np.pad(
-            a, [(0, max_audio_len - len(a)), (0, 0)], constant_values=config.pad_value
-        )
-        for a in selected_audios
-    ]
-
-    # Convert to arrays
-    text_arr = np.array(text_batch, dtype=np.uint8)
-    audio_arr = np.array(audio_batch, dtype=np.int16)
-
-    # Reshape for gradient accumulation
     if config.g_accum_iters:
-        text_arr = text_arr.reshape(config.g_accum_iters, config.batch_size, -1)
-        audio_arr = audio_arr.reshape(config.g_accum_iters, config.batch_size, -1, 9)
+        text_arr = text_arr.reshape(config.g_accum_iters, config.batch_size, config.text_length)
+        audio_arr = audio_arr.reshape(
+            config.g_accum_iters, config.batch_size, config.audio_length, 9
+        )
 
     return text_arr, audio_arr
 
@@ -116,42 +109,36 @@ def apply_audio_delay(
     delay_pattern: tp.List[int] = [0, 1, 2, 3, 4, 5, 6, 7, 8],
 ) -> np.ndarray:
     """
-    Apply codebook delay pattern to audio tokens with padding
+    Apply a codebook delay pattern to audio tokens without changing the sequence length.
+
+    The input and output audio both have shape [batch, seq_len, 9]. For each codebook channel,
+    tokens are shifted right by the specified delay. Positions where valid data is not available
+    due to the shift are filled with pad_value. This implementation is fully vectorized.
 
     Args:
-        audio: int16 array of shape [batch, seq_len, 9]
-        pad_value: Value used for padding delayed sequences
-        delay_pattern: List of delay steps for each codebook (length must match 9)
+        audio: int16 array of shape [batch, seq_len, 9].
+        pad_value: Padding value.
+        delay_pattern: List of delay steps for each codebook (must have length 9).
 
     Returns:
-        int16 array of shape [batch, seq_len + max(delay), 9] with delayed codebooks
+        int16 array of shape [batch, seq_len, 9] with delayed codebooks.
     """
     if len(delay_pattern) != 9:
         raise ValueError("Delay pattern must contain exactly 9 elements")
-
-    batch_size, seq_len, _ = audio.shape
-    max_delay = max(delay_pattern)
-    new_seq_len = seq_len + max_delay
-
-    # Initialize output array with padding
-    delayed = np.full((batch_size, new_seq_len, 9), pad_value, dtype=audio.dtype)
-
-    for cb_idx, delay in enumerate(delay_pattern):
-        # Calculate padding for this codebook
-        right_pad = max_delay - delay
-
-        # Pad and shift the codebook tokens
-        padded = np.pad(
-            audio[..., cb_idx],
-            [(0, 0), (delay, right_pad)],  # (left, right) padding on time axis
-            mode="constant",
-            constant_values=pad_value,
-        )
-
-        # Insert into output array
-        delayed[..., cb_idx] = padded
-
-    return delayed
+    B, T, C = audio.shape
+    delay_arr = np.array(delay_pattern)  # Shape: (C,)
+    # Create a time index grid.
+    t_idx = np.arange(T)[None, :, None]            # Shape: (1, T, 1)
+    delay_broadcast = delay_arr[None, None, :]       # Shape: (1, 1, C)
+    # Compute source indices for each channel.
+    new_t = t_idx - delay_broadcast                 # Shape: (1, T, C), broadcasts to (B, T, C)
+    valid = new_t >= 0                              # Boolean mask for valid indices.
+    # Create broadcastable indices for batch and channel.
+    b_idx = np.arange(B)[:, None, None]             # Shape: (B, 1, 1)
+    c_idx = np.arange(C)[None, None, :]              # Shape: (1, 1, C)
+    result = np.full((B, T, C), pad_value, dtype=audio.dtype)
+    result[valid] = audio[b_idx[valid], new_t[valid], c_idx[valid]]
+    return result
 
 
 def revert_audio_delay(
@@ -160,41 +147,30 @@ def revert_audio_delay(
     pad_value: int,
 ) -> np.ndarray:
     """
-    Reverse codebook delay pattern to recover original audio tokens
+    Reverse the codebook delay pattern to recover original audio tokens without changing the sequence length.
+
+    The input and output audio both have shape [batch, seq_len, 9]. For each codebook channel,
+    tokens are shifted left by the specified delay. Positions where valid data is not available
+    due to the shift are filled with pad_value. This implementation is fully vectorized.
 
     Args:
-        delayed_audio: int16 array of shape [batch, delayed_seq_len, 9]
-        delay_pattern: Original delay pattern used for shifting
-        pad_value: Padding value used in delayed audio
+        delayed_audio: int16 array of shape [batch, seq_len, 9].
+        delay_pattern: The delay pattern originally applied (must have length 9).
+        pad_value: Padding value.
 
     Returns:
-        int16 array of shape [batch, original_seq_len, 9] with aligned codebooks
+        int16 array of shape [batch, seq_len, 9] with recovered codebooks.
     """
     if len(delay_pattern) != 9:
         raise ValueError("Delay pattern must contain exactly 9 elements")
-
-    batch_size, delayed_seq_len, _ = delayed_audio.shape
-    max_delay = max(delay_pattern)
-    original_seq_len = delayed_seq_len - max_delay
-
-    if original_seq_len <= 0:
-        raise ValueError("Invalid delayed audio sequence length")
-
-    # Initialize output array
-    reverted = np.full(
-        (batch_size, original_seq_len, 9), pad_value, dtype=delayed_audio.dtype
-    )
-
-    for cb_idx, delay in enumerate(delay_pattern):
-        # Calculate valid slice positions
-        start = delay
-        end = start + original_seq_len
-
-        # Extract original codebook sequence
-        codebook_slice = delayed_audio[:, start:end, cb_idx]
-
-        # Handle any remaining padding
-        valid_mask = codebook_slice != pad_value
-        reverted[..., cb_idx] = np.where(valid_mask, codebook_slice, pad_value)
-
-    return reverted
+    B, T, C = delayed_audio.shape
+    delay_arr = np.array(delay_pattern)  # Shape: (C,)
+    t_idx = np.arange(T)[None, :, None]            # Shape: (1, T, 1)
+    delay_broadcast = delay_arr[None, None, :]       # Shape: (1, 1, C)
+    new_t = t_idx + delay_broadcast                 # Shape: (1, T, C)
+    valid = new_t < T
+    b_idx = np.arange(B)[:, None, None]
+    c_idx = np.arange(C)[None, None, :]
+    result = np.full((B, T, C), pad_value, dtype=delayed_audio.dtype)
+    result[valid] = delayed_audio[b_idx[valid], new_t[valid], c_idx[valid]]
+    return result
