@@ -9,3 +9,4 @@ outputs
 *_env
 wandb/
 plugins/
+.venv/

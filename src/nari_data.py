@@ -87,7 +87,6 @@ def apply_audio_delay(
 
     Args:
       audio_BTC (np.ndarray): int16 array with shape [B, T, 9] 
-         (B=batch size, T=audio frames, 9=channels).
       pad_value (int): Padding value.
       delay_pattern (List[int]): Delay steps for each channel (length 9).
 
@@ -98,13 +97,17 @@ def apply_audio_delay(
         raise ValueError("Delay pattern must have 9 elements")
     B, T, C = audio_BTC.shape
     delay_arr_C = np.array(delay_pattern)
-    t_idx_BTx1 = np.broadcast_to(np.arange(T)[None, :], (B, T))[:, :, None]
-    new_t_BTC = t_idx_BTx1 - delay_arr_C[None, None, :]
-    valid_BTC = new_t_BTC >= 0
+
+    # make t index
+    t_idx_BT1 = np.broadcast_to(np.arange(T)[None, :], (B, T))[:, :, None]
+    t_idx_BTC = t_idx_BT1 - delay_arr_C[None, None, :]
+
+    # make b, c index
     b_idx_BTC = np.broadcast_to(np.arange(B)[:, None, None], (B, T, C))
     c_idx_BTC = np.broadcast_to(np.arange(C)[None, None, :], (B, T, C))
-    result_BTC = np.full((B, T, C), pad_value, dtype=audio_BTC.dtype)
-    result_BTC[valid_BTC] = audio_BTC[b_idx_BTC[valid_BTC], new_t_BTC[valid_BTC], c_idx_BTC[valid_BTC]]
+
+    # apply indexing & padding
+    result_BTC = np.where(t_idx_BTC < 0, pad_value, audio_BTC[b_idx_BTC, t_idx_BTC, c_idx_BTC])
     return result_BTC
 
 def revert_audio_delay(
@@ -127,11 +130,15 @@ def revert_audio_delay(
         raise ValueError("Delay pattern must have 9 elements")
     B, T, C = delayed_audio_BTC.shape
     delay_arr_C = np.array(delay_pattern)
-    t_idx_BTx1 = np.broadcast_to(np.arange(T)[None, :], (B, T))[:, :, None]
-    new_t_BTC = t_idx_BTx1 + delay_arr_C[None, None, :]
-    valid_BTC = new_t_BTC < T
+
+    # make t index
+    t_idx_BT1 = np.broadcast_to(np.arange(T)[None, :], (B, T))[:, :, None]
+    t_idx_BTC = t_idx_BT1 + delay_arr_C[None, None, :]
+
+    # make b, c index
     b_idx_BTC = np.broadcast_to(np.arange(B)[:, None, None], (B, T, C))
     c_idx_BTC = np.broadcast_to(np.arange(C)[None, None, :], (B, T, C))
-    result_BTC = np.full((B, T, C), pad_value, dtype=delayed_audio_BTC.dtype)
-    result_BTC[valid_BTC] = delayed_audio_BTC[b_idx_BTC[valid_BTC], new_t_BTC[valid_BTC], c_idx_BTC[valid_BTC]]
+
+    # apply indexing & padding
+    result_BTC = np.where(t_idx_BTC >= T, pad_value, audio_BTC[b_idx_BTC, t_idx_BTC, c_idx_BTC])
     return result_BTC
