@@ -21,21 +21,6 @@ class DataLoaderConfig:
     pad_value: int = 0
     delay_pattern: tp.List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6, 7, 8])
 
-def load_raw_int16(file_path: tf.Tensor) -> tf.Tensor:
-    """
-    Loads a raw binary file containing int16 data and reshapes it to [-1, 9].
-
-    Args:
-      file_path (tf.Tensor): Scalar string tensor representing the file path.
-    
-    Returns:
-      tf.Tensor: An int16 tensor of shape [num_frames, 9].
-    """
-    raw = tf.io.read_file(file_path)
-    audio = tf.io.decode_raw(raw, tf.int16)
-    audio = tf.reshape(audio, [-1, 9])
-    return audio
-
 def load_pair(text_file: tf.Tensor, audio_file: tf.Tensor) -> tp.Tuple[tf.Tensor, tf.Tensor]:
     """
     Loads a pair of files: a text file and its corresponding raw binary audio file.
@@ -53,7 +38,8 @@ def load_pair(text_file: tf.Tensor, audio_file: tf.Tensor) -> tp.Tuple[tf.Tensor
         - audio: tf.Tensor of type int16 with shape [num_frames, 9].
     """
     text = tf.io.decode_raw(tf.io.read_file(text_file), tf.uint8)
-    audio = load_raw_int16(audio_file)
+    audio = tf.io.decode_raw(tf.io.read_file(audio_file), tf.int16)
+    audio = tf.reshape(audio, [-1, 9])
     return text, audio
 
 def process_sample(text: tf.Tensor, audio: tf.Tensor, config: DataLoaderConfig) -> tp.Tuple[tf.Tensor, tf.Tensor]:
